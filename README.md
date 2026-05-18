@@ -1,7 +1,7 @@
 # lr_tools
 Tools for human long-read genome sequencing experiments
 
-# analyze_chrx_xci_bam
+# xci_from_bam
 
 Haplotype-specific CpG island methylation analysis on chrX for X-chromosome inactivation (XCI) bias detection from haplotagged PacBio HiFi BAM files.
 
