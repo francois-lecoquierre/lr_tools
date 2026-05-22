@@ -13,10 +13,13 @@ Sorties :
   - <PREFIX>.chrx_xci.per_island.tsv     : une ligne par îlot (agrégat)
   - <PREFIX>.chrx_xci.scatter.html       : scatter méthylation hap1 vs hap2
   - <PREFIX>.chrx_xci.distribution.html  : distribution KDE par haplotype
+  - <PREFIX>.chrx_xci.histogram.html     : histogrammes de méthylation hap1 / hap2
   - <PREFIX>.chrx_xci.igv.bed            : îlots colorés pour IGV/UCSC (BED9)
+  - <PREFIX>.chrx_xci.summary.json       : stats clés (fusionnable multi-samples)
 """
 
 import argparse
+import json
 import os
 import sys
 
@@ -24,7 +27,8 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import pysam
-from scipy.stats import gaussian_kde
+from scipy.stats import gaussian_kde, norm as sp_norm
+from sklearn.mixture import GaussianMixture
 
 # ------------------------------------------------------------------
 # Régions pseudoautosomales de chrX (GRCh38) — exclues de l'analyse
@@ -111,6 +115,17 @@ def parse_args() -> argparse.Namespace:
         "--hemi-high", type=float, default=DEFAULT_HEMI_HIGH, metavar="F",
         help=f"Borne haute de la fenêtre hémi-méthylation (fraction, tous reads confondus). "
              f"(défaut : {DEFAULT_HEMI_HIGH})",
+    )
+    parser.add_argument(
+        "--phasing-mode", required=True, choices=["read_backed", "pedigree"],
+        metavar="MODE",
+        help=(
+            "Mode de phasage (obligatoire) : "
+            "'read_backed' = phasage local par read, distribution bimodale par haplotype, "
+            "biais estimé par GMM à 2 composantes ; "
+            "'pedigree' = phasage chromosomique consistant, distribution unimodale par haplotype, "
+            "biais estimé directement par la médiane."
+        ),
     )
     return parser.parse_args()
 
@@ -234,6 +249,50 @@ def _delta_to_rgb(delta: float) -> str:
     b = int(n[2] + t * (target[2] - n[2]))
     return f"{r},{g},{b}"
 
+SEX_CHRY_THRESHOLD = 0.10   # fraction chrY/(chrX+chrY) au-delà de laquelle → M
+CHROM_Y            = "chrY"
+
+
+def _infer_sex(bam_path: str) -> tuple[str, int, int]:
+    """
+    Infère le sexe chromosomique en lisant les statistiques de l'index BAI
+    (nombre de reads mappés par contig, sans parcourir les reads).
+    Retourne (sexe, n_chrx, n_chry).
+    """
+    with pysam.AlignmentFile(bam_path, "rb") as bam:
+        stats  = {s.contig: s.mapped for s in bam.get_index_statistics()}
+    n_chrx = stats.get(CHROM,   0)
+    n_chry = stats.get(CHROM_Y, 0)
+    total  = n_chrx + n_chry
+    if total == 0:
+        return "unknown", 0, 0
+    chry_frac = n_chry / total
+    return ("M" if chry_frac > SEX_CHRY_THRESHOLD else "F"), n_chrx, n_chry
+
+
+def _fit_gmm(pct_series: pd.Series, init_low: float = 25.0, init_high: float = 75.0):
+    """
+    Ajuste un GMM à 2 composantes gaussiennes sur une série de pourcentages (0–100).
+    Initialisation aux positions init_low / init_high pour stabiliser la convergence.
+    Retourne (means, stds, weights) triés par moyenne croissante, ou None si < 10 valeurs.
+    """
+    vals = pct_series.dropna().values
+    if len(vals) < 10:
+        return None
+    gmm = GaussianMixture(
+        n_components=2,
+        means_init=[[init_low], [init_high]],
+        random_state=42,
+        max_iter=300,
+    )
+    gmm.fit(vals.reshape(-1, 1))
+    order   = np.argsort(gmm.means_.ravel())
+    means   = gmm.means_.ravel()[order]
+    stds    = np.sqrt(gmm.covariances_.ravel()[order])
+    weights = gmm.weights_[order]
+    return means, stds, weights
+
+
 def main() -> None:
     args = parse_args()
 
@@ -246,6 +305,7 @@ def main() -> None:
     MIN_READS_HAP = args.min_reads_per_hap
     HEMI_LOW      = args.hemi_low
     HEMI_HIGH     = args.hemi_high
+    PHASING_MODE  = args.phasing_mode
 
     os.makedirs(out_dir, exist_ok=True)
 
@@ -253,14 +313,16 @@ def main() -> None:
     OUT_PER_ISLAND = os.path.join(out_dir, f"{PREFIX}.chrx_xci.per_island.tsv")
     OUT_SCATTER    = os.path.join(out_dir, f"{PREFIX}.chrx_xci.scatter.html")
     OUT_DISTRIB    = os.path.join(out_dir, f"{PREFIX}.chrx_xci.distribution.html")
+    OUT_HIST       = os.path.join(out_dir, f"{PREFIX}.chrx_xci.histogram.html")
     OUT_BED        = os.path.join(out_dir, f"{PREFIX}.chrx_xci.igv.bed")
+    OUT_SUMMARY    = os.path.join(out_dir, f"{PREFIX}.chrx_xci.summary.json")
 
     print(f"BAM          : {bam_path}")
     print(f"Îlots CpG    : {args.cpg_islands}")
     print(f"Sorties      : {out_dir}")
     print(f"Paramètres   : min_cpg={MIN_CPG}, meth_frac_thr={METH_FRAC}, "
           f"meth_prob_thr={METH_PROB}/255, min_reads_per_hap={MIN_READS_HAP}, "
-          f"hemi=[{HEMI_LOW:.0%}–{HEMI_HIGH:.0%}]\n")
+          f"hemi=[{HEMI_LOW:.0%}–{HEMI_HIGH:.0%}], phasing_mode={PHASING_MODE}\n")
 
     # Vérification de l'index BAM
     bai_candidates = [bam_path + ".bai", bam_path.replace(".bam", ".bai")]
@@ -270,9 +332,45 @@ def main() -> None:
               file=sys.stderr)
 
     # ------------------------------------------------------------------
+    # 0. Sex-check rapide (indépendant de l'analyse XCI)
+    # ------------------------------------------------------------------
+    print("[0/7] Inférence du sexe via les statistiques de l'index BAI...")
+    inferred_sex, _sex_n_chrx, _sex_n_chry = _infer_sex(bam_path)
+    _sex_total     = _sex_n_chrx + _sex_n_chry
+    _sex_chry_frac = (_sex_n_chry / _sex_total) if _sex_total > 0 else float("nan")
+    print(f"      chrX={_sex_n_chrx}, chrY={_sex_n_chry}, "
+          f"frac_chrY={_sex_chry_frac:.0%}  →  sexe inféré : {inferred_sex}")
+
+    if inferred_sex == "M":
+        print("      [INFO] Sexe masculin : analyse XCI non applicable. "
+              "Production du résumé JSON uniquement.")
+        summary_early = {
+            "sample":                   PREFIX,
+            "bam":                      bam_path,
+            "inferred_sex":             inferred_sex,
+            "sex_check_n_chrx_sampled": _sex_n_chrx,
+            "sex_check_n_chry_sampled": _sex_n_chry,
+            "sex_check_chry_frac":      round(_sex_chry_frac, 3) if not np.isnan(_sex_chry_frac) else None,
+            "phasing_mode":             PHASING_MODE,
+            "params": {
+                "min_cpg":           MIN_CPG,
+                "meth_frac_thr":     METH_FRAC,
+                "meth_prob_thr":     METH_PROB,
+                "min_reads_per_hap": MIN_READS_HAP,
+                "hemi_low":          HEMI_LOW,
+                "hemi_high":         HEMI_HIGH,
+            },
+        }
+        with open(OUT_SUMMARY, "w", encoding="utf-8") as fh:
+            json.dump(summary_early, fh, indent=2, ensure_ascii=False)
+        print(f"      Résumé JSON  → {OUT_SUMMARY}")
+        print("[--] Analyse XCI ignorée (sexe M).")
+        sys.exit(0)
+
+    # ------------------------------------------------------------------
     # 1. Chargement des îlots CpG (non PAR)
     # ------------------------------------------------------------------
-    print(f"[1/6] Chargement des îlots CpG non pseudoautosomaux ({CHROM})...")
+    print(f"[1/7] Chargement des îlots CpG non pseudoautosomaux ({CHROM})...")
     islands_df, par_islands_df = load_cpg_islands(args.cpg_islands, chrom=CHROM)
     print(f"      Îlots retenus : {len(islands_df)}")
 
@@ -283,7 +381,7 @@ def main() -> None:
     # ------------------------------------------------------------------
     # 2. Parcours du BAM — classification de chaque read par île
     # ------------------------------------------------------------------
-    print(f"[2/6] Analyse des reads par îlot CpG ({len(islands_df)} îlots)...")
+    print(f"[2/7] Analyse des reads par îlot CpG ({len(islands_df)} îlots)...")
     per_read_records = []
     n_islands = len(islands_df)
 
@@ -345,7 +443,7 @@ def main() -> None:
     # ------------------------------------------------------------------
     # 3. Écriture de la table par read + agrégation par île
     # ------------------------------------------------------------------
-    print("[3/6] Écriture des tables...")
+    print("[3/7] Écriture des tables...")
     per_read_df.to_csv(OUT_PER_READ, sep="\t", index=False)
     print(f"      Par read     → {OUT_PER_READ}")
 
@@ -398,7 +496,7 @@ def main() -> None:
     # ------------------------------------------------------------------
     # 4. Fichier BED de visualisation (IGV/UCSC)
     # ------------------------------------------------------------------
-    print("[4/6] Écriture du fichier BED de visualisation (IGV/UCSC)...")
+    print("[4/7] Écriture du fichier BED de visualisation (IGV/UCSC)...")
 
     # Îles PAR
     bed_rows = []
@@ -466,7 +564,7 @@ def main() -> None:
     # ------------------------------------------------------------------
     # 5. Figures Plotly
     # ------------------------------------------------------------------
-    print("[5/6] Génération des figures...")
+    print("[5/7] Génération des figures...")
 
     n_cov = int((
         (per_island_df["n_meth_hap1"] + per_island_df["n_unmeth_hap1"] >= MIN_READS_HAP) &
@@ -487,22 +585,63 @@ def main() -> None:
     h1_mean = h1_pct.mean()   if not h1_pct.empty else float("nan")
     h2_mean = h2_pct.mean()   if not h2_pct.empty else float("nan")
 
+    # --- Estimation du biais XCI ---
+    gmm_combined = None
+    xci_bias = xci_bias_hap1 = xci_bias_hap2 = float("nan")
+    if PHASING_MODE == "read_backed":
+        # Série combinée : concaténation hap1+hap2 (chaque île contribue 2 observations)
+        combined_pct = pd.concat([h1_pct, h2_pct], ignore_index=True)
+        gmm_combined = _fit_gmm(combined_pct)
+        if gmm_combined is not None:
+            peak_low  = gmm_combined[0][0]
+            peak_high = gmm_combined[0][1]
+            xci_bias  = (peak_low / 100.0 + (1.0 - peak_high / 100.0)) / 2.0
+            print(f"      GMM combin\u00e9 : \u03bc_low={peak_low:.1f}%  \u03bc_high={peak_high:.1f}%  "
+                  f"\u2192 biais XCI = {xci_bias:.0%}\u2013{1 - xci_bias:.0%}")
+    else:  # pedigree
+        combined_pct = pd.concat([h1_pct, h2_pct], ignore_index=True)
+        xci_bias_hap1 = float(h1_med / 100) if not np.isnan(h1_med) else float("nan")
+        xci_bias_hap2 = float(h2_med / 100) if not np.isnan(h2_med) else float("nan")
+        print(f"      Hap1 m\u00e9diane : {h1_med:.1f}%  \u2192 fraction X inactif hap1 = {xci_bias_hap1:.0%}")
+        print(f"      Hap2 m\u00e9diane : {h2_med:.1f}%  \u2192 fraction X inactif hap2 = {xci_bias_hap2:.0%}")
+
+    # --- HTML résumé biais (inséré dans le tableau de stats) ---
+    if PHASING_MODE == "read_backed" and gmm_combined is not None:
+        _bias_str = f"{xci_bias:.0%}\u2013{1 - xci_bias:.0%}" if not np.isnan(xci_bias) else "N/A"
+        _bias_html = (
+            f"<tr><td><strong>Biais XCI (GMM combin\u00e9)</strong></td>"
+            f"<td colspan='2' style='text-align:center'><strong>{_bias_str}</strong></td></tr>"
+            f"<tr><td><strong>Pic actif \u2013 \u03bc GMM</strong></td>"
+            f"<td colspan='2' style='text-align:center'>{gmm_combined[0][0]:.1f}%</td></tr>"
+            f"<tr><td><strong>Pic inactif \u2013 \u03bc GMM</strong></td>"
+            f"<td colspan='2' style='text-align:center'>{gmm_combined[0][1]:.1f}%</td></tr>"
+        )
+    elif PHASING_MODE == "pedigree":
+        _bh1 = f"{xci_bias_hap1:.0%}" if not np.isnan(xci_bias_hap1) else "N/A"
+        _bh2 = f"{xci_bias_hap2:.0%}" if not np.isnan(xci_bias_hap2) else "N/A"
+        _bias_html = (
+            f"<tr><td><strong>Fraction X inactif (m\u00e9diane)</strong></td>"
+            f"<td class='pat'>{_bh1}</td><td class='mat'>{_bh2}</td></tr>"
+        )
+    else:
+        _bias_html = ""
+
     # --- Sections HTML communes aux deux figures ---
     _html_sections = f"""
 <div class="section">
   <h3>Objectif</h3>
-  <p>Détection d'un biais d'inactivation du chromosome X (XCI) par analyse haplotype-spécifique
-  de la méthylation des îlots CpG non pseudoautosomaux. Chaque read couvrant intégralement
-  un îlot est classifié (méthylé / non méthylé / partiel) selon la fraction de CpG méthylés,
-  puis les résultats sont agrégés par haplotype (tag HP WhatsHap).</p>
+  <p>D\u00e9tection d'un biais d'inactivation du chromosome X (XCI) par analyse haplotype-sp\u00e9cifique
+  de la m\u00e9thylation des \u00eelots CpG non pseudoautosomaux. Chaque read couvrant int\u00e9gralement
+  un \u00eelot est classifi\u00e9 (m\u00e9thyl\u00e9 / non m\u00e9thyl\u00e9 / partiel) selon la fraction de CpG m\u00e9thyl\u00e9s,
+  puis les r\u00e9sultats sont agr\u00e9g\u00e9s par haplotype (tag HP WhatsHap).</p>
 </div>
 <div class="section">
-  <h3>Résultats</h3>
+  <h3>R\u00e9sultats</h3>
   <p>
-    Ìlots non-PAR : <strong>{len(islands_df)}</strong>
+    \u00cclots non-PAR : <strong>{len(islands_df)}</strong>
     &nbsp;|&nbsp; Reads retenus : <strong>{len(per_read_df)}</strong>
-    &nbsp;|&nbsp; Couverture ≥{MIN_READS_HAP} reads/haplotype : <strong>{n_cov}</strong>
-    &nbsp;|&nbsp; Hémi-méthylés ({HEMI_LOW:.0%}–{HEMI_HIGH:.0%}) retenus : <strong>{len(valid)}</strong>
+    &nbsp;|&nbsp; Couverture \u2265{MIN_READS_HAP} reads/haplotype : <strong>{n_cov}</strong>
+    &nbsp;|&nbsp; H\u00e9mi-m\u00e9thyl\u00e9s ({HEMI_LOW:.0%}\u2013{HEMI_HIGH:.0%}) retenus : <strong>{len(valid)}</strong>
   </p>
   <table class="stats">
     <tr>
@@ -511,28 +650,30 @@ def main() -> None:
       <td class="mat">&#9632; Haplotype 2</td>
     </tr>
     <tr>
-      <td><strong>Médiane méthylation</strong></td>
+      <td><strong>M\u00e9diane m\u00e9thylation</strong></td>
       <td class="pat">{h1_med:.1f}%</td>
       <td class="mat">{h2_med:.1f}%</td>
     </tr>
     <tr>
-      <td><strong>Moyenne méthylation</strong></td>
+      <td><strong>Moyenne m\u00e9thylation</strong></td>
       <td class="pat">{h1_mean:.1f}%</td>
       <td class="mat">{h2_mean:.1f}%</td>
     </tr>
+    {_bias_html}
   </table>
 </div>
 <div class="section">
-  <h3>Méthodes</h3>
+  <h3>M\u00e9thodes</h3>
   <p>
-    <strong>Données :</strong> BAM haplotaggé PacBio HiFi (tags HP, MM/ML)<br>
-    <strong>Régions :</strong> {CHROM} non pseudoautosomal (PAR1/PAR2 GRCh38 exclus)<br>
+    <strong>Donn\u00e9es :</strong> BAM haplotaggu\u00e9 PacBio HiFi (tags HP, MM/ML)<br>
+    <strong>R\u00e9gions :</strong> {CHROM} non pseudoautosomal (PAR1/PAR2 GRCh38 exclus)<br>
+    <strong>Mode de phasage :</strong> {PHASING_MODE}<br>
     <strong>Seuils :</strong>
-    CpG méthylé si ML &ge;&nbsp;{METH_PROB}/255 (≈&nbsp;{METH_PROB / 255:.2f}),
-    minimum {MIN_CPG} CpG/read dans l'île,
-    classification méthylé/non méthylé si fraction &ge;&nbsp;{METH_FRAC:.0%},
-    minimum {MIN_READS_HAP} reads informatifs (méthylés + non méthylés) par haplotype,
-    hémi-méthylation globale [{HEMI_LOW:.0%}–{HEMI_HIGH:.0%}] (tous reads confondus, partiels exclus)
+    CpG m\u00e9thyl\u00e9 si ML &ge;&nbsp;{METH_PROB}/255 (\u2248&nbsp;{METH_PROB / 255:.2f}),
+    minimum {MIN_CPG} CpG/read dans l'\u00eele,
+    classification m\u00e9thyl\u00e9/non m\u00e9thyl\u00e9 si fraction &ge;&nbsp;{METH_FRAC:.0%},
+    minimum {MIN_READS_HAP} reads informatifs (m\u00e9thyl\u00e9s + non m\u00e9thyl\u00e9s) par haplotype,
+    h\u00e9mi-m\u00e9thylation globale [{HEMI_LOW:.0%}\u2013{HEMI_HIGH:.0%}] (tous reads confondus, partiels exclus)
   </p>
 </div>
 """
@@ -632,13 +773,14 @@ def main() -> None:
     )
     print(f"      Scatter      → {OUT_SCATTER}")
 
-    # ---- Figure 2 : Distribution KDE hap1 / hap2 -------------------------
+    # ---- Figure 2 : Distribution KDE hap1 / hap2 / combiné ---------------
     fig_dist = go.Figure()
     x_grid = np.linspace(0, 100, 500)
 
     for pct, color, fill_color, name in [
-        (h1_pct, "steelblue", "rgba(70,130,180,0.15)", "Haplotype 1"),
-        (h2_pct, "tomato",    "rgba(255,99,71,0.15)",  "Haplotype 2"),
+        (h1_pct,       "steelblue", "rgba(70,130,180,0.15)", "Haplotype 1"),
+        (h2_pct,       "tomato",    "rgba(255,99,71,0.15)",  "Haplotype 2"),
+        (combined_pct, "seagreen",  "rgba(46,139,87,0.10)",  "Combiné (hap1+hap2)"),
     ]:
         if len(pct.dropna()) >= 2:
             kde = gaussian_kde(pct.dropna(), bw_method="scott")
@@ -648,6 +790,26 @@ def main() -> None:
                 line=dict(color=color, width=3),
                 fill="tozeroy", fillcolor=fill_color,
             ))
+
+    # Overlay GMM combiné (read_backed) ou ligne médiane verticale (pedigree)
+    if PHASING_MODE == "read_backed" and gmm_combined is not None:
+        means_g, stds_g, weights_g = gmm_combined
+        for k in range(2):
+            y_comp = weights_g[k] * sp_norm.pdf(x_grid, means_g[k], stds_g[k])
+            fig_dist.add_trace(go.Scatter(
+                x=x_grid, y=y_comp,
+                mode="lines",
+                line=dict(color="seagreen", width=1.5, dash="dash"),
+                showlegend=False,
+                hoverinfo="none",
+            ))
+    elif PHASING_MODE == "pedigree":
+        for pct_val, color in [(h1_med, "steelblue"), (h2_med, "tomato")]:
+            if not np.isnan(pct_val):
+                fig_dist.add_vline(
+                    x=pct_val,
+                    line=dict(color=color, dash="dash", width=1.5),
+                )
 
     fig_dist.update_layout(
         title=dict(
@@ -671,7 +833,114 @@ def main() -> None:
     )
     print(f"      Distribution → {OUT_DISTRIB}")
 
-    print("[6/6] Terminé.")
+    # ---- Figure 3 : Histogrammes hap1 / hap2 / combiné (counts) ----------
+    fig_hist = go.Figure()
+    _bin_width = 100.0 / 50  # 50 bins sur [0, 100]
+    for pct, color, opacity, name in [
+        (h1_pct,       "steelblue", 0.55, "Haplotype 1"),
+        (h2_pct,       "tomato",    0.55, "Haplotype 2"),
+        (combined_pct, "seagreen",  0.40, "Combiné (hap1+hap2)"),
+    ]:
+        fig_hist.add_trace(go.Histogram(
+            x=pct.dropna(),
+            name=name,
+            nbinsx=50,
+            marker_color=color,
+            opacity=opacity,
+            hovertemplate=(
+                f"<b>{name}</b><br>"
+                "Méthylation : %{x:.1f}%<br>"
+                "Nombre d'\u00eelots : %{y}<br>"
+                "<extra></extra>"
+            ),
+        ))
+    # Overlay GMM combiné (read_backed) ou ligne médiane verticale (pedigree)
+    if PHASING_MODE == "read_backed" and gmm_combined is not None:
+        means_g, stds_g, weights_g = gmm_combined
+        n_combined = len(combined_pct.dropna())
+        for k in range(2):
+            y_comp = n_combined * _bin_width * weights_g[k] * sp_norm.pdf(x_grid, means_g[k], stds_g[k])
+            fig_hist.add_trace(go.Scatter(
+                x=x_grid, y=y_comp,
+                mode="lines",
+                line=dict(color="seagreen", width=1.5, dash="dash"),
+                showlegend=False,
+                hoverinfo="none",
+            ))
+    elif PHASING_MODE == "pedigree":
+        for pct_val, color in [(h1_med, "steelblue"), (h2_med, "tomato")]:
+            if not np.isnan(pct_val):
+                fig_hist.add_vline(
+                    x=pct_val,
+                    line=dict(color=color, dash="dash", width=1.5),
+                )
+
+    fig_hist.update_layout(
+        barmode="overlay",
+        title=dict(
+            text=(
+                f"Distribution de la méthylation par îlot — {CHROM} | {PREFIX}"
+                " — Histogrammes (counts, 50 bins)"
+            ),
+            x=0.5, xanchor="center",
+        ),
+        xaxis=dict(title="Fraction de méthylation des îlots (%)", range=[0, 100]),
+        yaxis_title="Nombre d'îlots",
+        legend=dict(x=0.70, y=0.95),
+        template="plotly_white",
+        width=960, height=500,
+        margin=dict(t=80, b=60),
+    )
+    _write_html_page(
+        fig_hist,
+        title=f"XCI {CHROM} — {PREFIX} — Histogrammes",
+        out_path=OUT_HIST,
+    )
+    print(f"      Histogrammes → {OUT_HIST}")
+
+    # ------------------------------------------------------------------
+    # 6. Résumé JSON (fusionnable multi-samples)
+    # ------------------------------------------------------------------
+    print("[6/7] Écriture du résumé JSON...")
+
+    summary = {
+        "sample":                       PREFIX,
+        "bam":                          bam_path,
+        "inferred_sex":                 inferred_sex,
+        "sex_check_n_chrx_sampled":     _sex_n_chrx,
+        "sex_check_n_chry_sampled":     _sex_n_chry,
+        "sex_check_chry_frac":          round(_sex_chry_frac, 3) if not np.isnan(_sex_chry_frac) else None,
+        "n_islands_nonPAR":             len(islands_df),
+        "n_reads_retained":             len(per_read_df),
+        "n_islands_sufficient_coverage": n_cov,
+        "n_islands_hemi_methylated":    len(valid),
+        "meth_frac_hap1_median":        round(float(h1_med),  4) if not np.isnan(h1_med)  else None,
+        "meth_frac_hap2_median":        round(float(h2_med),  4) if not np.isnan(h2_med)  else None,
+        "meth_frac_hap1_mean":          round(float(h1_mean), 4) if not np.isnan(h1_mean) else None,
+        "meth_frac_hap2_mean":          round(float(h2_mean), 4) if not np.isnan(h2_mean) else None,
+        "phasing_mode":                 PHASING_MODE,
+        **({
+            "xci_bias":      round(xci_bias, 4) if not np.isnan(xci_bias) else None,
+            "gmm_peak_low":  round(float(gmm_combined[0][0]), 2) if gmm_combined is not None else None,
+            "gmm_peak_high": round(float(gmm_combined[0][1]), 2) if gmm_combined is not None else None,
+        } if PHASING_MODE == "read_backed" else {
+            "xci_bias_hap1": round(xci_bias_hap1, 4) if not np.isnan(xci_bias_hap1) else None,
+            "xci_bias_hap2": round(xci_bias_hap2, 4) if not np.isnan(xci_bias_hap2) else None,
+        }),
+        "params": {
+            "min_cpg":          MIN_CPG,
+            "meth_frac_thr":    METH_FRAC,
+            "meth_prob_thr":    METH_PROB,
+            "min_reads_per_hap": MIN_READS_HAP,
+            "hemi_low":         HEMI_LOW,
+            "hemi_high":        HEMI_HIGH,
+        },
+    }
+    with open(OUT_SUMMARY, "w", encoding="utf-8") as fh:
+        json.dump(summary, fh, indent=2, ensure_ascii=False)
+    print(f"      Résumé JSON  → {OUT_SUMMARY}")
+
+    print("[7/7] Terminé.")
 
 
 if __name__ == "__main__":
