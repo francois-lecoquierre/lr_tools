@@ -19,8 +19,3 @@ For each non-pseudoautosomal CpG island on chrX, the script:
 - numpy
 - plotly
 - scipy
-
-Install with:
-
-```bash
-pip install pysam pandas numpy plotly scipy
